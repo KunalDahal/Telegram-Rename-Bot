@@ -1,7 +1,9 @@
 services:
-  renamer2bot:
+  renamebot:
     build: .
-    container_name: renamer2bot
+    # Keep the Docker container name aligned with COMMAND_POSTFIX in .env.
+    # Example: COMMAND_POSTFIX=2 -> renamerbot2
+    container_name: renamerbot${COMMAND_POSTFIX:-}
     restart: unless-stopped
     mem_limit: 950m
     env_file:

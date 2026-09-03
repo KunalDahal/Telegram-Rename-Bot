@@ -81,13 +81,10 @@ class Config:
             "",
         ).strip()
 
-        # Keep Telegram target values as strings/int-like strings.
-        #
-        # Why:
-        # - private chats/channels can be represented by -100... IDs
-        # - public chats can be represented by @username
-        # - invite links may be handled by the appropriate session code
-        #   instead of being rejected by Config before the worker sees them.
+        # Telegram targets stay as strings because:
+        # - BOT_DUMP_CHAT_ID is normally a numeric -100... bot-side peer ID
+        # - DUMP_CHAT_ID may be a private invite URL used only by SESSION_STRING
+        # - public @usernames are also valid Telegram targets.
         self.dump_chat_id: str | None = self._optional_chat_target_env(
             "DUMP_CHAT_ID"
         )
@@ -178,5 +175,18 @@ class Config:
         if not self.mongo_db_name:
             raise ValueError("MONGO_DB_NAME cannot be empty")
 
+        # Bot-side dump is independent from the optional Premium session.
         if self.bot_dump_chat_id is None:
-            raise ValueError("BOT_DUMP_CHAT_ID is required")
+            raise ValueError(
+                "BOT_DUMP_CHAT_ID is required for the bot session. "
+                "Use the numeric -100... ID of the dump channel."
+            )
+
+        # Premium-side dump is only required when a Premium SESSION_STRING
+        # has actually been supplied.
+        if self.session_string and self.dump_chat_id is None:
+            raise ValueError(
+                "DUMP_CHAT_ID is required when SESSION_STRING is configured. "
+                "Use the Premium account's private invite link or a public "
+                "username."
+            )

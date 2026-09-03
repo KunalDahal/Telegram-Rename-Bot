@@ -99,18 +99,16 @@ async def main():
         set_worker_instance(worker)
 
         if config.session_string:
-            try:
-                await worker.configure_premium_download_session(
-                    config.session_string
-                )
-                logging.info(
-                    "Premium download session enabled from SESSION_STRING."
-                )
-            except Exception:
-                logging.exception(
-                    "SESSION_STRING could not be used; "
-                    "using normal bot downloads."
-                )
+            await worker.configure_premium_download_session(
+                config.session_string
+            )
+            logging.info(
+                "Premium download session enabled from SESSION_STRING."
+            )
+        else:
+            logging.info(
+                "SESSION_STRING not configured; Premium download path is disabled."
+            )
 
         setup_set_handlers(
             app=app,

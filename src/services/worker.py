@@ -28,7 +28,13 @@ class Worker:
         self.download_client = client
         self._premium_download_client: Client | None = None
         self._retired_download_clients: list[Client] = []
+
+        # Bot-side dump. This belongs exclusively to BOT_TOKEN.
         self._dump_chat_id: int | None = None
+
+        # Premium-side view of the same dump channel. This is only populated
+        # when SESSION_STRING is configured and DUMP_CHAT_ID is resolved.
+        self._premium_dump_chat_id: int | None = None
         self.config = config
         self.media_processor = MediaProcessor(config.paths.ffmpeg)
         self.temp_base = config.paths.tmp
@@ -90,12 +96,21 @@ class Worker:
         return self._premium_download_client is not None
 
     async def configure_premium_download_session(self, session_string: str):
-        """Start and select a Premium user client for downloads only.
+        """Configure the optional Premium user session.
 
-        The bot client remains responsible for commands, status messages, and
-        delivering renamed files.  A separate user session is required because
-        bot sessions cannot download Telegram files larger than 2 GiB.
+        BOT_TOKEN remains responsible for normal bot operations and the
+        bot-side dump. DUMP_CHAT_ID is used only by this Premium user session.
         """
+        session_string = (session_string or "").strip()
+        if not session_string:
+            raise ValueError("SESSION_STRING is empty.")
+
+        premium_dump_target = getattr(self.config, "dump_chat_id", None)
+        if not premium_dump_target:
+            raise ValueError(
+                "DUMP_CHAT_ID is required when SESSION_STRING is configured."
+            )
+
         candidate = Client(
             "premium_download_session",
             api_id=self.config.api_id,
@@ -104,13 +119,26 @@ class Worker:
             in_memory=True,
             no_updates=True,
         )
+
         try:
             await candidate.start()
             account = await candidate.get_me()
+
             if account.is_bot:
-                raise ValueError("This is a bot session, not a user session.")
+                raise ValueError(
+                    "SESSION_STRING belongs to a bot account, not a user account."
+                )
+
             if not getattr(account, "is_premium", False):
-                raise ValueError("The user account is not Telegram Premium.")
+                raise ValueError(
+                    "The Telegram account in SESSION_STRING is not Premium."
+                )
+
+            premium_dump_id = await self._prepare_dump_chat(
+                candidate,
+                str(premium_dump_target),
+            )
+
         except Exception:
             try:
                 await candidate.stop()
@@ -118,78 +146,70 @@ class Worker:
                 pass
             raise
 
-        # Validate/prepare the dump channel with the Premium account before
-        # making the session available to the worker.  This is deliberately
-        # done only after the session has been verified as a real Premium user.
-        if DUMP_CHAT_ID:
-            self._dump_chat_id = await self._prepare_dump_chat(candidate, DUMP_CHAT_ID)
-            logger.info("[Worker] Premium dump channel ready: %s", self._dump_chat_id)
-        else:
-            self._dump_chat_id = None
-            logger.warning("[Worker] DUMP_CHAT_ID is not configured.")
-
         previous = self._premium_download_client
         self._premium_download_client = candidate
         self.download_client = candidate
+        self._premium_dump_chat_id = premium_dump_id
+
         if previous:
-            # Existing tasks may still be using it; stop it when the worker
-            # stops instead of interrupting a download in progress.
             self._retired_download_clients.append(previous)
+
+        logger.info(
+            "[Worker] Premium session enabled: user_id=%s premium_dump_chat=%s",
+            getattr(account, "id", "unknown"),
+            self._premium_dump_chat_id,
+        )
         return account
 
     async def _prepare_dump_chat(self, client: Client, configured_chat: str) -> int:
-        """Resolve the dump chat and let the Premium account join when possible.
+        """Resolve the Premium-side dump target.
 
-        Numeric private chat IDs cannot be joined from an ID alone; the account
-        must already be a member. Public usernames and Telegram invite links
-        can be joined automatically.
+        A private invite URL can be joined by the user session. A numeric
+        private ID requires the Premium account to already be a member.
         """
         target = (configured_chat or "").strip()
         if not target:
             raise ValueError("DUMP_CHAT_ID is empty.")
 
-        # Keep Telegram invite URLs intact; Pyrogram accepts usernames,
-        # invite links, and already-resolved numeric chat IDs.
-        join_target = target
-
         try:
             chat = await client.get_chat(target)
+            if not chat or not getattr(chat, "id", None):
+                raise ValueError("Telegram returned an invalid dump chat.")
             return int(chat.id)
-        except Exception as lookup_error:
+        except Exception:
             logger.info(
-                "[Worker] Premium account is not currently a member of dump "
-                "chat %r; attempting to join it.",
+                "[Worker] Premium session could not resolve DUMP_CHAT_ID=%r; "
+                "trying join_chat().",
                 target,
             )
 
-        # Telegram public usernames and invite links can be joined. A numeric
-        # -100... ID does not contain enough information to join a private chat.
         if target.startswith("-100") and target.lstrip("-").isdigit():
             raise ValueError(
-                "Premium account is not a member of DUMP_CHAT_ID=%s. "
-                "A numeric private channel ID cannot be joined automatically; "
-                "add the Premium account to the channel once or use a Telegram "
-                "invite link in DUMP_CHAT_ID." % target
+                f"Premium account cannot resolve numeric DUMP_CHAT_ID={target}. "
+                "Add the Premium account to the dump channel first, or provide "
+                "the private invite link in DUMP_CHAT_ID."
             )
-        else:
-            # Bare public usernames are accepted by join_chat as well.
-            join_target = target
 
         try:
-            chat = await client.join_chat(join_target)
-        except Exception as join_error:
+            chat = await client.join_chat(target)
+        except Exception as exc:
             raise ValueError(
-                f"Premium account could not join DUMP_CHAT_ID={target!r}: {join_error}"
-            ) from join_error
+                f"Premium account could not resolve/join DUMP_CHAT_ID={target!r}: "
+                f"{exc}"
+            ) from exc
 
         if not chat or not getattr(chat, "id", None):
-            raise ValueError(f"Premium dump chat could not be resolved: {target!r}")
+            raise ValueError(
+                f"Premium dump chat could not be resolved from {target!r}."
+            )
+
         return int(chat.id)
 
     async def _stop_download_clients(self) -> None:
         clients = [self._premium_download_client, *self._retired_download_clients]
         self._premium_download_client = None
         self._retired_download_clients.clear()
+        self._premium_dump_chat_id = None
         self.download_client = self.client
         for client in clients:
             if not client:
@@ -268,107 +288,70 @@ class Worker:
         return self._uses_premium_download(task)
 
     async def _resolve_bot_dump_chat(self, configured_chat: str):
-        """Resolve the bot-side dump chat robustly.
-
-        For private chats/channels, a numeric -100... ID is only useful if the
-        current Pyrogram session already knows the peer. Enumerating dialogs
-        gives the bot session an opportunity to learn/cash the peer before the
-        final lookup. Public @usernames can be resolved directly.
-
-        Invite links are intentionally rejected for the bot session because a
-        bot cannot join a private channel using a t.me/+ invite URL.
-        """
+        """Resolve BOT_DUMP_CHAT_ID using the bot session only."""
         target = (configured_chat or "").strip()
-
         if not target:
-            raise RuntimeError(
-                "BOT_DUMP_CHAT_ID must be configured."
-            )
+            raise RuntimeError("BOT_DUMP_CHAT_ID is required.")
 
         if "+" in target and (
             "t.me/" in target or "telegram.me/" in target
         ):
             raise RuntimeError(
                 "BOT_DUMP_CHAT_ID cannot be a private invite URL. "
-                "Add the bot to the dump chat and use the numeric -100... "
-                "chat ID or a public @username."
+                "Use the numeric -100... ID of the channel where the bot "
+                "is already a member."
             )
 
-        # Public usernames are directly resolvable.
-        if target.startswith("@"):
-            try:
+        try:
+            if target.startswith("@"):
                 return await self.client.get_chat(target)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Bot cannot resolve BOT_DUMP_CHAT_ID={target!r}. "
-                    "Verify that the username is correct and that the bot "
-                    "has access to the chat."
-                ) from exc
 
-        try:
             target_id = int(target)
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Invalid BOT_DUMP_CHAT_ID={target!r}. "
-                "Use a numeric -100... Telegram chat ID or a public @username."
-            ) from exc
-
-        # First inspect dialogs. This matters for a cold Pyrogram session:
-        # get_chat(-100...) may raise PEER_ID_INVALID if the peer is not yet
-        # present in the local peer database.
-        try:
-            async for dialog in self.client.get_dialogs():
-                chat = getattr(dialog, "chat", None)
-                if chat and getattr(chat, "id", None) == target_id:
-                    return chat
-        except Exception:
-            logger.warning(
-                "[Worker] Failed while enumerating bot dialogs during dump "
-                "chat resolution.",
-                exc_info=True,
-            )
-
-        # Fall back to direct resolution in case the peer is already cached
-        # or is otherwise resolvable without dialog enumeration.
-        try:
             return await self.client.get_chat(target_id)
+
         except Exception as exc:
             raise RuntimeError(
-                f"Bot cannot resolve BOT_DUMP_CHAT_ID={target_id}. "
-                "The exact bot represented by BOT_TOKEN must be a member of "
-                "the dump chat. Verify the numeric -100... ID and bot "
-                "membership/permissions."
+                f"Bot cannot resolve BOT_DUMP_CHAT_ID={target!r}. "
+                "The exact bot represented by BOT_TOKEN must already be a "
+                "member of the dump channel, and the configured ID must be "
+                "the correct numeric -100... channel ID."
             ) from exc
 
     async def _initialize_dump_chat(self) -> None:
-        # The bot-side archive/copy path uses BOT_DUMP_CHAT_ID.
-        bot_target = getattr(self.config, "bot_dump_chat_id", None)
+        """Initialize the mandatory BOT_TOKEN-side dump.
 
-        # Backward-compatible fallback if an older Config implementation is
-        # used, while still preferring the explicit bot dump setting.
-        if not bot_target:
-            bot_target = getattr(self.config, "dump_chat_id", None)
+        DUMP_CHAT_ID is deliberately not read here. It belongs only to the
+        optional Premium SESSION_STRING client.
+        """
+        bot_target = getattr(self.config, "bot_dump_chat_id", None)
 
         if not bot_target:
             raise RuntimeError(
-                "BOT_DUMP_CHAT_ID (or DUMP_CHAT_ID) must be configured. "
-                "Use a numeric -100... chat ID or a public @username "
-                "for the bot-side dump archive."
+                "BOT_DUMP_CHAT_ID is required. "
+                "Use the numeric -100... ID of the bot's dump channel."
             )
 
         chat = await self._resolve_bot_dump_chat(str(bot_target))
 
         if not chat or not getattr(chat, "id", None):
             raise RuntimeError(
-                f"BOT_DUMP_CHAT_ID={bot_target!r} could not be resolved "
-                "for the bot session."
+                f"BOT_DUMP_CHAT_ID={bot_target!r} could not be resolved."
             )
 
         self._dump_chat_id = int(chat.id)
 
-        # Make startup diagnostics explicit: if Telegram returns a member
-        # status, log it so permission issues are distinguishable from peer
-        # resolution issues.
+        # If Premium is enabled, both sessions are intended to operate on the
+        # same dump channel. Fail early if the two configured targets resolve
+        # to different channels.
+        if self._premium_dump_chat_id is not None:
+            if self._premium_dump_chat_id != self._dump_chat_id:
+                raise RuntimeError(
+                    "Dump channel mismatch: BOT_DUMP_CHAT_ID resolves to "
+                    f"{self._dump_chat_id}, while DUMP_CHAT_ID resolves to "
+                    f"{self._premium_dump_chat_id}. Both must refer to the "
+                    "same dump channel."
+                )
+
         try:
             me = await self.client.get_me()
             member = await self.client.get_chat_member(
@@ -377,22 +360,24 @@ class Worker:
             )
             status = getattr(member, "status", "unknown")
             logger.info(
-                "[Worker] Bot dump chat ready: %s (%s); bot status=%s",
-                getattr(chat, "title", None) or getattr(chat, "username", None) or self._dump_chat_id,
+                "[Worker] Bot dump ready: %s (%s); bot status=%s",
+                getattr(chat, "title", None)
+                or getattr(chat, "username", None)
+                or self._dump_chat_id,
                 self._dump_chat_id,
                 status,
             )
         except Exception:
-            # Resolution succeeded; inability to inspect membership should not
-            # turn a known-valid peer into a false PEER_ID_INVALID diagnosis.
+            # The peer itself has already been resolved. A membership-status
+            # lookup failure should not be reported as PEER_ID_INVALID.
             logger.info(
-                "[Worker] Bot dump chat resolved: %s",
+                "[Worker] Bot dump resolved: %s",
                 self._dump_chat_id,
             )
 
     async def _stage_source_to_dump(self, task: dict) -> None:
         if not self._dump_chat_id:
-            raise RuntimeError("Dump chat is not initialized.")
+            raise RuntimeError("Bot dump chat is not initialized.")
 
         existing_chat_id = task.get("download_source_chat_id")
         existing_message_id = task.get("download_source_message_id")
@@ -572,23 +557,39 @@ class Worker:
         task["upload_progress"] = {"percentage": 0.0}
 
         if not self._dump_chat_id:
-            raise Exception("DUMP_CHAT_ID is required for archived uploads.")
+            raise RuntimeError(
+                "BOT_DUMP_CHAT_ID could not be resolved for the bot session."
+            )
 
-        # The final renamed file is always uploaded to the dump first.
-        # Sub-2 GiB files use the bot; larger files use the configured Premium
-        # user session. In both cases the user receives a copy from the dump.
         use_premium_dump = self._uses_premium_dump(task)
-        if use_premium_dump and not self.has_premium_download_session:
-            raise Exception("Files above 2 GiB require a valid SESSION_STRING for the Telegram Premium account.")
 
-        upload_client = self._premium_download_client if use_premium_dump else self.client
+        if use_premium_dump:
+            if not self.has_premium_download_session:
+                raise RuntimeError(
+                    "Files above 2 GiB require a valid SESSION_STRING "
+                    "for a Telegram Premium account."
+                )
+
+            if not self._premium_dump_chat_id:
+                raise RuntimeError(
+                    "Premium dump chat is not initialized. "
+                    "DUMP_CHAT_ID must be configured when SESSION_STRING "
+                    "is used."
+                )
+
+            upload_client = self._premium_download_client
+            upload_chat_id = self._premium_dump_chat_id
+        else:
+            upload_client = self.client
+            upload_chat_id = self._dump_chat_id
+
         upload_data = {
             **task,
             "upload_file_path": file_path,
             "output_filename": job["output_filename"],
             "send_type": job.get("send_type", "media"),
             "thumbnail_path": await self._resolve_thumbnail(task, job),
-            "upload_chat_id": self._dump_chat_id,
+            "upload_chat_id": upload_chat_id,
         }
 
         uploader = Uploader(
@@ -596,27 +597,34 @@ class Worker:
             upload_data,
             self.task_queue,
             tmp_dir=self.temp_base,
-            # The upload client, not the end-user account, determines the
-            # Telegram upload-size limit. Only the Premium upload client gets
-            # the larger part size.
             user_is_premium=use_premium_dump,
         )
+
         results = await uploader.upload()
 
         if not results:
-            raise Exception("Upload completed without returning a dump message.")
+            raise RuntimeError(
+                "Upload completed without returning a dump message."
+            )
 
         task["dump_renamed_message_ids"] = [
-            result.id for result in results if result and getattr(result, "id", None)
+            result.id
+            for result in results
+            if result and getattr(result, "id", None)
         ]
+
         if len(task["dump_renamed_message_ids"]) != len(results):
-            raise Exception("Upload returned an invalid dump message.")
+            raise RuntimeError("Upload returned an invalid dump message.")
+
         self.task_queue.checkpoint(task_id)
 
+        # BOT_TOKEN performs delivery even when the Premium client uploaded
+        # the file. Both sessions have been validated against the same dump
+        # channel when Premium is enabled.
         for result in results:
             await self.client.copy_message(
                 chat_id=task["user_id"],
-                from_chat_id=self._dump_chat_id,
+                from_chat_id=upload_chat_id,
                 message_id=result.id,
             )
 
