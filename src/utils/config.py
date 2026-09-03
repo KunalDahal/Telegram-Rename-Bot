@@ -87,9 +87,10 @@ class Config:
         ).strip()
 
         # Telegram targets stay as strings because:
-        # - BOT_DUMP_CHAT_ID is normally a numeric -100... bot-side peer ID
-        # - DUMP_CHAT_ID may be a private invite URL used only by SESSION_STRING
-        # - public @usernames are also valid Telegram targets.
+        # - BOT_DUMP_CHAT_ID may be a numeric -100... ID, public @username,
+        #   or a private invite URL for the bot-side dump.
+        # - DUMP_CHAT_ID may be a private invite URL or public @username for
+        #   the optional Premium SESSION_STRING.
         self.dump_chat_id: str | None = self._optional_chat_target_env(
             "DUMP_CHAT_ID"
         )
@@ -184,7 +185,8 @@ class Config:
         if self.bot_dump_chat_id is None:
             raise ValueError(
                 "BOT_DUMP_CHAT_ID is required for the bot session. "
-                "Use the numeric -100... ID of the dump channel."
+                "Use a numeric -100... ID, @username, or invite URL for "
+                "the bot-side dump channel."
             )
 
         # Premium-side dump is only required when a Premium SESSION_STRING

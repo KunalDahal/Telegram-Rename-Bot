@@ -288,34 +288,138 @@ class Worker:
         return self._uses_premium_download(task)
 
     async def _resolve_bot_dump_chat(self, configured_chat: str):
-        """Resolve BOT_DUMP_CHAT_ID using the bot session only."""
+        """Resolve BOT_DUMP_CHAT_ID using the bot session.
+
+        Accepted targets:
+        - numeric -100... chat ID
+        - public @username
+        - Telegram private invite URL
+
+        For an invite URL, get_chat() is attempted first. If the bot has not
+        joined yet, join_chat() is attempted. Pyrogram documents join_chat()
+        as usable by bots and accepts t.me invite links.
+        """
         target = (configured_chat or "").strip()
+
+        logger.info(
+            "[Bot Dump] Starting bot-side dump resolution: target=%r "
+            "session_mode=%s",
+            target,
+            "BOT_SESSION_STRING"
+            if getattr(self.config, "bot_session_string", "")
+            else "file-based",
+        )
+
         if not target:
             raise RuntimeError("BOT_DUMP_CHAT_ID is required.")
 
-        if "+" in target and (
-            "t.me/" in target or "telegram.me/" in target
-        ):
-            raise RuntimeError(
-                "BOT_DUMP_CHAT_ID cannot be a private invite URL. "
-                "Use the numeric -100... ID of the channel where the bot "
-                "is already a member."
+        try:
+            me = await self.client.get_me()
+            logger.info(
+                "[Bot Dump] Bot identity before resolution: id=%s username=@%s",
+                me.id,
+                me.username or "",
+            )
+        except Exception:
+            logger.exception("[Bot Dump] Could not retrieve bot identity.")
+            raise
+
+        # 1. Try direct resolution first. This works for numeric IDs,
+        # usernames, and invite links when the bot already has access.
+        try:
+            logger.info(
+                "[Bot Dump] Step 1: get_chat(%r)",
+                target,
+            )
+            chat = await self.client.get_chat(target)
+
+            logger.info(
+                "[Bot Dump] Step 1 SUCCESS: id=%s title=%r username=%r "
+                "type=%r is_preview=%s",
+                getattr(chat, "id", None),
+                getattr(chat, "title", None),
+                getattr(chat, "username", None),
+                getattr(chat, "type", None),
+                chat.__class__.__name__ == "ChatPreview",
             )
 
+            if chat and getattr(chat, "id", None):
+                # A ChatPreview means the bot can see the target but may not
+                # have joined yet. For invite links, attempt to join.
+                if chat.__class__.__name__ != "ChatPreview":
+                    return chat
+
+                if "+" not in target:
+                    return chat
+
+                logger.info(
+                    "[Bot Dump] Invite returned a ChatPreview; attempting "
+                    "join_chat(%r).",
+                    target,
+                )
+
+        except Exception:
+            logger.warning(
+                "[Bot Dump] Step 1 get_chat(%r) failed; checking whether "
+                "this is an invite link that can be joined.",
+                target,
+                exc_info=True,
+            )
+
+        # 2. Invite-link path.
+        if (
+            "t.me/+" in target
+            or "telegram.me/+" in target
+            or "t.me/joinchat/" in target
+            or "telegram.me/joinchat/" in target
+        ):
+            try:
+                logger.info(
+                    "[Bot Dump] Step 2: join_chat(%r)",
+                    target,
+                )
+                chat = await self.client.join_chat(target)
+
+                logger.info(
+                    "[Bot Dump] Step 2 SUCCESS: id=%s title=%r username=%r type=%r",
+                    getattr(chat, "id", None),
+                    getattr(chat, "title", None),
+                    getattr(chat, "username", None),
+                    getattr(chat, "type", None),
+                )
+
+                if chat and getattr(chat, "id", None):
+                    return chat
+
+                raise RuntimeError(
+                    "join_chat() returned no usable chat object."
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "[Bot Dump] Step 2 join_chat(%r) FAILED.",
+                    target,
+                )
+                raise RuntimeError(
+                    f"Bot could not resolve/join BOT_DUMP_CHAT_ID={target!r}: "
+                    f"{exc}"
+                ) from exc
+
+        # 3. Public username / numeric ID failed direct resolution.
         try:
-            if target.startswith("@"):
-                return await self.client.get_chat(target)
-
             target_id = int(target)
-            return await self.client.get_chat(target_id)
-
-        except Exception as exc:
+        except ValueError:
             raise RuntimeError(
                 f"Bot cannot resolve BOT_DUMP_CHAT_ID={target!r}. "
-                "The exact bot represented by BOT_TOKEN must already be a "
-                "member of the dump channel, and the configured ID must be "
-                "the correct numeric -100... channel ID."
-            ) from exc
+                "Use a numeric -100... ID, a public @username, or a valid "
+                "Telegram invite link."
+            )
+
+        raise RuntimeError(
+            f"Bot cannot resolve BOT_DUMP_CHAT_ID={target_id}. "
+            "Telegram/Pyrogram did not resolve this numeric peer for the "
+            "current bot session. Verify the channel ID and bot access."
+        )
 
     async def _initialize_dump_chat(self) -> None:
         """Initialize the mandatory BOT_TOKEN-side dump.
