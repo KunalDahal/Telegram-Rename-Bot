@@ -42,13 +42,12 @@ logging.basicConfig(
 
 
 async def main():
-    logging.info("[Startup] Beginning application startup.")
     config = Config()
     config.paths.makedirs()
+
     logging.info(
-        "[Startup] Runtime directories ready: logs=%s tmp=%s",
-        config.paths.logs,
-        config.paths.tmp,
+        "[Bot] Session mode: %s",
+        "BOT_SESSION_STRING" if config.bot_session_string else "file-based Pyrogram session",
     )
 
     app = Client(
@@ -56,9 +55,11 @@ async def main():
         api_id=config.api_id,
         api_hash=config.api_hash,
         bot_token=config.bot_token,
+        session_string=config.bot_session_string or None,
         workdir=config.paths.logs,
         workers=32,
         max_concurrent_transmissions=config.gl_limit,
+        in_memory=bool(config.bot_session_string),
     )
 
     task_queue = TaskQueue()
@@ -84,23 +85,14 @@ async def main():
 
     worker = None
 
+    await app.start()
     logging.info(
-        "[Bot] Creating Pyrogram bot client: session_name=%s workdir=%s",
-        "encode_bot_session",
-        config.paths.logs,
+        "[Bot] Pyrogram bot client connected and session started "
+        "(persistent_session=%s).",
+        bool(config.bot_session_string),
     )
 
-    await app.start()
-    logging.info("[Bot] Pyrogram bot client connected and session started.")
-
     try:
-        me = await app.get_me()
-        logging.info(
-            "[Bot] Identity: id=%s username=@%s is_bot=%s",
-            me.id,
-            me.username or "",
-            getattr(me, "is_bot", None),
-        )
         await access_control.initialize()
         user_settings_store.initialize()
 
@@ -116,33 +108,24 @@ async def main():
                 recovered_count,
             )
 
-        logging.info("[Worker] Constructing Worker instance.")
         worker = Worker(task_queue, get_user_settings, app, config)
         set_worker_instance(worker)
-        logging.info(
-            "[Worker] Worker constructed. bot_dump=%r premium_dump=%r",
-            config.bot_dump_chat_id,
-            config.dump_chat_id,
-        )
 
         if config.session_string:
             logging.info(
-                "[Premium] SESSION_STRING is present; starting Premium "
-                "user session and resolving DUMP_CHAT_ID=%r.",
-                config.dump_chat_id,
+                "[Premium] SESSION_STRING present; initializing optional "
+                "Premium user session."
             )
-            try:
-                await worker.configure_premium_download_session(
-                    config.session_string
-                )
-                logging.info(
-                    "Premium download session enabled from SESSION_STRING."
-                )
-            except Exception:
-                logging.exception(
-                    "SESSION_STRING could not be used; "
-                    "using normal bot downloads."
-                )
+            await worker.configure_premium_download_session(
+                config.session_string
+            )
+            logging.info(
+                "[Premium] Premium download session enabled."
+            )
+        else:
+            logging.info(
+                "[Premium] SESSION_STRING not configured; Premium path disabled."
+            )
 
         setup_set_handlers(
             app=app,
@@ -201,10 +184,6 @@ async def main():
         # Start the worker under supervision. If Worker.start() raises,
         # the exception must reach the main task instead of becoming
         # "Task exception was never retrieved" while the bot stays alive.
-        logging.info(
-            "[Worker] Starting worker. BOT_DUMP_CHAT_ID=%r",
-            config.bot_dump_chat_id,
-        )
         worker_task = asyncio.create_task(
             worker.start(),
             name="telegram-rename-worker",
