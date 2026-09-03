@@ -1,0 +1,14 @@
+pyrogram
+tgcrypto
+python-dotenv
+FFmpeg-python
+pydantic
+psutil
+humanize
+aiofiles 
+aiohttp 
+telegraph
+httpx
+fonttools
+pymediainfo
+motor
