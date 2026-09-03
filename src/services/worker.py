@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 BOT_DOWNLOAD_LIMIT = 2 * 1024 ** 3
 PREMIUM_DOWNLOAD_LIMIT = 4 * 1024 ** 3
-DUMP_CHAT_ID = os.getenv("DUMP_CHAT_ID", "").strip()
-BOT_DUMP_CHAT_ID = os.getenv("BOT_DUMP_CHAT_ID", "").strip()
 MAX_PIPELINE_SLOTS = 4
 
 
@@ -269,39 +267,128 @@ class Worker:
     def _uses_premium_dump(self, task: dict) -> bool:
         return self._uses_premium_download(task)
 
+    async def _resolve_bot_dump_chat(self, configured_chat: str):
+        """Resolve the bot-side dump chat robustly.
+
+        For private chats/channels, a numeric -100... ID is only useful if the
+        current Pyrogram session already knows the peer. Enumerating dialogs
+        gives the bot session an opportunity to learn/cash the peer before the
+        final lookup. Public @usernames can be resolved directly.
+
+        Invite links are intentionally rejected for the bot session because a
+        bot cannot join a private channel using a t.me/+ invite URL.
+        """
+        target = (configured_chat or "").strip()
+
+        if not target:
+            raise RuntimeError(
+                "BOT_DUMP_CHAT_ID must be configured."
+            )
+
+        if "+" in target and (
+            "t.me/" in target or "telegram.me/" in target
+        ):
+            raise RuntimeError(
+                "BOT_DUMP_CHAT_ID cannot be a private invite URL. "
+                "Add the bot to the dump chat and use the numeric -100... "
+                "chat ID or a public @username."
+            )
+
+        # Public usernames are directly resolvable.
+        if target.startswith("@"):
+            try:
+                return await self.client.get_chat(target)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Bot cannot resolve BOT_DUMP_CHAT_ID={target!r}. "
+                    "Verify that the username is correct and that the bot "
+                    "has access to the chat."
+                ) from exc
+
+        try:
+            target_id = int(target)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid BOT_DUMP_CHAT_ID={target!r}. "
+                "Use a numeric -100... Telegram chat ID or a public @username."
+            ) from exc
+
+        # First inspect dialogs. This matters for a cold Pyrogram session:
+        # get_chat(-100...) may raise PEER_ID_INVALID if the peer is not yet
+        # present in the local peer database.
+        try:
+            async for dialog in self.client.get_dialogs():
+                chat = getattr(dialog, "chat", None)
+                if chat and getattr(chat, "id", None) == target_id:
+                    return chat
+        except Exception:
+            logger.warning(
+                "[Worker] Failed while enumerating bot dialogs during dump "
+                "chat resolution.",
+                exc_info=True,
+            )
+
+        # Fall back to direct resolution in case the peer is already cached
+        # or is otherwise resolvable without dialog enumeration.
+        try:
+            return await self.client.get_chat(target_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bot cannot resolve BOT_DUMP_CHAT_ID={target_id}. "
+                "The exact bot represented by BOT_TOKEN must be a member of "
+                "the dump chat. Verify the numeric -100... ID and bot "
+                "membership/permissions."
+            ) from exc
+
     async def _initialize_dump_chat(self) -> None:
-        # The bot must use a resolvable chat identifier. Telegram bot sessions
-        # cannot resolve private invite URLs (t.me/+hash) through get_chat().
-        # Keep DUMP_CHAT_ID for the Premium/user session, and allow a separate
-        # BOT_DUMP_CHAT_ID for the bot-side archive/copy operations.
-        bot_target = BOT_DUMP_CHAT_ID or DUMP_CHAT_ID
+        # The bot-side archive/copy path uses BOT_DUMP_CHAT_ID.
+        bot_target = getattr(self.config, "bot_dump_chat_id", None)
+
+        # Backward-compatible fallback if an older Config implementation is
+        # used, while still preferring the explicit bot dump setting.
+        if not bot_target:
+            bot_target = getattr(self.config, "dump_chat_id", None)
+
         if not bot_target:
             raise RuntimeError(
                 "BOT_DUMP_CHAT_ID (or DUMP_CHAT_ID) must be configured. "
-                "Use a numeric chat ID such as -100123... or a public @username "
+                "Use a numeric -100... chat ID or a public @username "
                 "for the bot-side dump archive."
             )
 
-        if "+" in bot_target and ("t.me/" in bot_target or "telegram.me/" in bot_target):
+        chat = await self._resolve_bot_dump_chat(str(bot_target))
+
+        if not chat or not getattr(chat, "id", None):
             raise RuntimeError(
-                "BOT_DUMP_CHAT_ID cannot be a private invite URL because Telegram "
-                "does not allow bot sessions to resolve t.me/+ invite links. "
-                "Add the bot to the dump chat, then set BOT_DUMP_CHAT_ID to the "
-                "numeric chat ID (-100...) or a public @username."
+                f"BOT_DUMP_CHAT_ID={bot_target!r} could not be resolved "
+                "for the bot session."
             )
 
-        try:
-            chat = await self.client.get_chat(bot_target)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Bot cannot access BOT_DUMP_CHAT_ID={bot_target!r}. "
-                "Add the bot to the dump chat and grant permission to send/forward files. "
-                "Use the numeric -100... chat ID for a private chat."
-            ) from exc
-        if not chat or not getattr(chat, "id", None):
-            raise RuntimeError("BOT_DUMP_CHAT_ID could not be resolved for the bot session.")
         self._dump_chat_id = int(chat.id)
-        logger.info("[Worker] Bot dump chat ready: %s", self._dump_chat_id)
+
+        # Make startup diagnostics explicit: if Telegram returns a member
+        # status, log it so permission issues are distinguishable from peer
+        # resolution issues.
+        try:
+            me = await self.client.get_me()
+            member = await self.client.get_chat_member(
+                self._dump_chat_id,
+                me.id,
+            )
+            status = getattr(member, "status", "unknown")
+            logger.info(
+                "[Worker] Bot dump chat ready: %s (%s); bot status=%s",
+                getattr(chat, "title", None) or getattr(chat, "username", None) or self._dump_chat_id,
+                self._dump_chat_id,
+                status,
+            )
+        except Exception:
+            # Resolution succeeded; inability to inspect membership should not
+            # turn a known-valid peer into a false PEER_ID_INVALID diagnosis.
+            logger.info(
+                "[Worker] Bot dump chat resolved: %s",
+                self._dump_chat_id,
+            )
 
     async def _stage_source_to_dump(self, task: dict) -> None:
         if not self._dump_chat_id:
