@@ -81,10 +81,13 @@ class Config:
             "",
         ).strip()
 
-        # Telegram targets stay as strings because:
-        # - BOT_DUMP_CHAT_ID is normally a numeric -100... bot-side peer ID
-        # - DUMP_CHAT_ID may be a private invite URL used only by SESSION_STRING
-        # - public @usernames are also valid Telegram targets.
+        # Keep Telegram target values as strings/int-like strings.
+        #
+        # Why:
+        # - private chats/channels can be represented by -100... IDs
+        # - public chats can be represented by @username
+        # - invite links may be handled by the appropriate session code
+        #   instead of being rejected by Config before the worker sees them.
         self.dump_chat_id: str | None = self._optional_chat_target_env(
             "DUMP_CHAT_ID"
         )
@@ -103,6 +106,20 @@ class Config:
         self.paths = Paths(self._SRC_DIR)
 
         self._validate()
+
+        # Diagnostic configuration summary. Never log tokens, hashes,
+        # MongoDB URIs, or session strings.
+        import logging
+        logging.getLogger(__name__).info(
+            "[Config] Loaded: postfix=%r bot_dump=%r premium_dump=%r "
+            "session_string_present=%s allowed_groups=%d owners=%d",
+            self.command_postfix,
+            self.bot_dump_chat_id,
+            self.dump_chat_id,
+            bool(self.session_string),
+            len(self.allowed_group_ids),
+            len(self.owner_ids),
+        )
 
     @staticmethod
     def _parse_int_list(raw: str) -> List[int]:
@@ -175,18 +192,5 @@ class Config:
         if not self.mongo_db_name:
             raise ValueError("MONGO_DB_NAME cannot be empty")
 
-        # Bot-side dump is independent from the optional Premium session.
         if self.bot_dump_chat_id is None:
-            raise ValueError(
-                "BOT_DUMP_CHAT_ID is required for the bot session. "
-                "Use the numeric -100... ID of the dump channel."
-            )
-
-        # Premium-side dump is only required when a Premium SESSION_STRING
-        # has actually been supplied.
-        if self.session_string and self.dump_chat_id is None:
-            raise ValueError(
-                "DUMP_CHAT_ID is required when SESSION_STRING is configured. "
-                "Use the Premium account's private invite link or a public "
-                "username."
-            )
+            raise ValueError("BOT_DUMP_CHAT_ID is required")
