@@ -101,7 +101,8 @@ class Config:
         self.gl_limit = self._positive_int_env("GL_LIMIT", default=4)
         self.dl_limit = self._positive_int_env("DL_LIMIT", default=4)
         # Premium-session download concurrency. Independent from DL_LIMIT.
-        self.pl_limit = self._positive_int_env("PL", default=4)
+        self.pm_dl_limit = self._positive_int_env("PM_DL_LIMIT", default=4)
+        self.pm_ul_limit = self._positive_int_env("PM_UL_LIMIT", default=1)
         self.ul_limit = self._positive_int_env("UL_LIMIT", default=1)
         self.wm_limit = self._positive_int_env("WM_LIMIT", default=1)
 
