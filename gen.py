@@ -6,7 +6,7 @@ load_dotenv()
 
 API_ID = os.getenv("API_ID", "your_api_id") 
 API_HASH = os.getenv("API_HASH", "your_api_hash")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "123456:ABCDEF...")
+BOT_TOKEN = "8997549247:AAGMOk8aCLYj9r-34bxyGo06HysPuydZ100"
 
 app = Client(
     "bot_session_generator",

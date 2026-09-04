@@ -667,6 +667,10 @@ def setup_rename_handler(app: Client, task_queue, user_settings, config, access_
     @app.on_message(command_filter(config, ["r", "rename"]) & allowed_group_filter)
     async def rename_command(client: Client, message: Message):
         await process_rename_command(
-            client, message, task_queue, user_settings, config.paths.tmp, access_control
-        ,
-            access_control=access_control)
+            client,
+            message,
+            task_queue,
+            user_settings,
+            config.paths.tmp,
+            access_control,
+        )
