@@ -192,11 +192,6 @@ class Config:
                 "the bot-side dump channel."
             )
 
-        # Premium-side dump is only required when a Premium SESSION_STRING
-        # has actually been supplied.
-        if self.session_string and self.dump_chat_id is None:
-            raise ValueError(
-                "DUMP_CHAT_ID is required when SESSION_STRING is configured. "
-                "Use the Premium account's private invite link or a public "
-                "username."
-            )
+        # DUMP_CHAT_ID is optional. Premium uploads use BOT_DUMP_CHAT_ID as
+        # the canonical staging target so BOT_TOKEN can always copy the result
+        # to the user's DM. DUMP_CHAT_ID is retained only for compatibility.

@@ -84,7 +84,19 @@ class Worker:
     async def start(self):
         self.running = True
         self._startup_cleanup()
+
+        # The bot dump is always initialized first because it is the final
+        # delivery staging area. Premium uploads are copied into this dump
+        # before BOT_TOKEN sends them to the user.
         await self._initialize_dump_chat()
+
+        # Initialize the optional Premium user session BEFORE accepting any
+        # queued work. This makes SESSION_STRING effective without requiring
+        # application code to remember a second initialization call.
+        session_string = str(getattr(self.config, "session_string", "") or "").strip()
+        if session_string:
+            await self.configure_premium_download_session(session_string)
+
         self._pool_worker_tasks = [
             asyncio.create_task(self._pool_worker_loop(index + 1))
             for index in range(self.pool_size)
@@ -122,10 +134,15 @@ class Worker:
         if not session_string:
             raise ValueError("SESSION_STRING is empty.")
 
-        premium_dump_target = getattr(self.config, "dump_chat_id", None)
+        # Premium uploads go directly to the bot-visible dump. This is the
+        # canonical staging chat because BOT_TOKEN must later copy the message
+        # into the user's DM. DUMP_CHAT_ID remains a fallback for old configs.
+        premium_dump_target = getattr(self.config, "bot_dump_chat_id", None)
+        if not premium_dump_target:
+            premium_dump_target = getattr(self.config, "dump_chat_id", None)
         if not premium_dump_target:
             raise ValueError(
-                "DUMP_CHAT_ID is required when SESSION_STRING is configured."
+                "BOT_DUMP_CHAT_ID (or DUMP_CHAT_ID) is required when SESSION_STRING is configured."
             )
 
         candidate = Client(
@@ -465,17 +482,12 @@ class Worker:
 
         self._dump_chat_id = int(chat.id)
 
-        # If Premium is enabled, both sessions are intended to operate on the
-        # same dump channel. Fail early if the two configured targets resolve
-        # to different channels.
-        if self._premium_dump_chat_id is not None:
-            if self._premium_dump_chat_id != self._dump_chat_id:
-                raise RuntimeError(
-                    "Dump channel mismatch: BOT_DUMP_CHAT_ID resolves to "
-                    f"{self._dump_chat_id}, while DUMP_CHAT_ID resolves to "
-                    f"{self._premium_dump_chat_id}. Both must refer to the "
-                    "same dump channel."
-                )
+        if bool(getattr(chat, "has_protected_content", False)):
+            raise RuntimeError(
+                "BOT_DUMP_CHAT_ID has content protection enabled. Disable "
+                "Protect Content/Restrict Saving Content in the dump channel; "
+                "BOT_TOKEN must be able to copy staged messages to user DMs."
+            )
 
         try:
             me = await self.client.get_me()
@@ -600,10 +612,10 @@ class Worker:
             self.task_queue.checkpoint(task_id)
 
             self.task_queue.update_status(task_id, "waiting_for_upload", 0)
-            file_size = int(task.get("file_size", 0) or 0)
+            actual_upload_size = os.path.getsize(upload_path)
             upload_slot = (
                 self._premium_upload_slot
-                if file_size > BOT_DOWNLOAD_LIMIT
+                if actual_upload_size > BOT_DOWNLOAD_LIMIT
                 else self._upload_slot
             )
             async with upload_slot:
@@ -743,14 +755,11 @@ class Worker:
                     "for upload."
                 )
 
-            if not self._premium_dump_chat_id:
-                raise RuntimeError(
-                    "Premium dump chat is not initialized. "
-                    "DUMP_CHAT_ID must be configured when SESSION_STRING is used."
-                )
-
+            # The Premium account performs the large-file upload, but the
+            # destination is the bot-visible dump so BOT_TOKEN can copy the
+            # resulting message to the user's DM.
             upload_client = self._premium_download_client
-            upload_chat_id = self._premium_dump_chat_id
+            upload_chat_id = self._dump_chat_id
         else:
             upload_client = self.client
             upload_chat_id = self._dump_chat_id
@@ -791,15 +800,75 @@ class Worker:
                 raise RuntimeError(
                     f"Upload returned no dump message for {part_name}."
                 )
+
+            # Both bot and Premium uploads now land in BOT_DUMP_CHAT_ID.
+            # The returned message IDs are therefore directly copyable by the bot.
             results.extend(part_results)
 
-        # Final delivery is ALWAYS BOT_TOKEN -> user DM.
+        # Final delivery is ALWAYS BOT_TOKEN -> user DM from BOT_DUMP_CHAT_ID.
+        # copy_message is preferred, but Telegram can reject a copy for some
+        # channel/message combinations. In that case, fetch the bot-visible
+        # message and re-send its media using the bot's own file_id. This keeps
+        # delivery entirely on BOT_TOKEN and avoids losing an already-uploaded
+        # file just because copy_message was rejected.
         for result in results:
-            await self.client.copy_message(
-                chat_id=task["user_id"],
-                from_chat_id=upload_chat_id,
-                message_id=result.id,
+            try:
+                await self.client.copy_message(
+                    chat_id=task["user_id"],
+                    from_chat_id=self._dump_chat_id,
+                    message_id=result.id,
+                )
+                continue
+            except Exception as copy_exc:
+                logger.warning(
+                    "[Worker] copy_message failed for dump message %s: %s; "
+                    "falling back to media re-send.",
+                    result.id,
+                    copy_exc,
+                )
+
+            source = await self.client.get_messages(
+                chat_id=self._dump_chat_id,
+                message_ids=result.id,
             )
+            if isinstance(source, list):
+                source = source[0] if source else None
+            if not source or getattr(source, "empty", False):
+                raise RuntimeError(
+                    f"Uploaded dump message {result.id} could not be read by BOT_TOKEN."
+                )
+
+            caption = getattr(source, "caption", None)
+            if getattr(source, "video", None):
+                await self.client.send_video(
+                    chat_id=task["user_id"],
+                    video=source.video.file_id,
+                    caption=caption,
+                    supports_streaming=True,
+                )
+            elif getattr(source, "document", None):
+                await self.client.send_document(
+                    chat_id=task["user_id"],
+                    document=source.document.file_id,
+                    caption=caption,
+                    force_document=True,
+                )
+            elif getattr(source, "audio", None):
+                await self.client.send_audio(
+                    chat_id=task["user_id"],
+                    audio=source.audio.file_id,
+                    caption=caption,
+                )
+            elif getattr(source, "photo", None):
+                await self.client.send_photo(
+                    chat_id=task["user_id"],
+                    photo=source.photo.file_id,
+                    caption=caption,
+                )
+            else:
+                raise RuntimeError(
+                    f"Dump message {result.id} contains no supported media for delivery."
+                )
 
     # ── Completion message ────────────────────────────────────────────────────
 
