@@ -730,16 +730,23 @@ class Worker:
                 "BOT_DUMP_CHAT_ID could not be resolved for the bot session."
             )
 
-        use_premium_dump = self._uses_premium_dump(task)
+        # Upload routing must be based on the ACTUAL prepared output size, not
+        # the original source size. Processing can make the output larger or
+        # smaller than the source file.
+        actual_upload_size = os.path.getsize(file_path)
+        use_premium_dump = actual_upload_size > BOT_DOWNLOAD_LIMIT
 
-        if use_premium_dump and not self.has_premium_download_session:
-            use_premium_dump = False
+        if use_premium_dump:
+            if not self.has_premium_download_session:
+                raise RuntimeError(
+                    "Files above 2 GiB require a valid Premium SESSION_STRING "
+                    "for upload."
+                )
 
             if not self._premium_dump_chat_id:
                 raise RuntimeError(
                     "Premium dump chat is not initialized. "
-                    "DUMP_CHAT_ID must be configured when SESSION_STRING "
-                    "is used."
+                    "DUMP_CHAT_ID must be configured when SESSION_STRING is used."
                 )
 
             upload_client = self._premium_download_client
@@ -750,8 +757,9 @@ class Worker:
 
         output_filename = job["output_filename"]
 
-        # Premium uploads stay whole. Without Premium, split only the final
-        # processed output and upload each part through the available client.
+        # Premium uploads use the Premium session; the uploader itself will
+        # split only when the configured Premium per-message limit requires it.
+        # Non-Premium uploads are split at the bot-safe part size.
         if use_premium_dump:
             upload_parts = [(file_path, output_filename)]
         else:

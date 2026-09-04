@@ -1,5 +1,4 @@
 import asyncio
-import math
 import os
 import shutil
 import time
@@ -77,6 +76,16 @@ class Uploader:
         file_size = os.path.getsize(final_file_path)
         max_part_sz = self._max_part_size()
         thumb = self.task_data.get("thumbnail_path")
+
+        if file_size > max_part_sz:
+            # The worker should normally route oversized outputs to Premium,
+            # but keep this guard here so the uploader never attempts to send
+            # an oversized single request through Telegram.
+            if not self.user_is_premium:
+                raise Exception(
+                    f"Non-Premium upload file is {file_size / (1024**3):.2f} GiB; "
+                    f"maximum per part is {max_part_sz / (1024**3):.2f} GiB."
+                )
 
         if file_size > max_part_sz:
             parts = await self._split_file(
