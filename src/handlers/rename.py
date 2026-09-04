@@ -635,7 +635,12 @@ async def process_rename_command(
     task_queue,
     user_settings,
     temp_base: str,
+    access_control,
 ):
+    # One access/DM-start check per /rename command, including the whole batch.
+    if not await _check_access(client, message, access_control):
+        return
+
     is_batch, batch_count, filename, parse_error = _parse_rename_command(message)
 
     if parse_error:
@@ -661,6 +666,7 @@ def setup_rename_handler(app: Client, task_queue, user_settings, config, access_
 
     @app.on_message(command_filter(config, ["r", "rename"]) & allowed_group_filter)
     async def rename_command(client: Client, message: Message):
-        if not await _check_access(client, message, access_control):
-            return
-        await process_rename_command(client, message, task_queue, user_settings, config.paths.tmp)
+        await process_rename_command(
+            client, message, task_queue, user_settings, config.paths.tmp, access_control
+        ,
+            access_control=access_control)

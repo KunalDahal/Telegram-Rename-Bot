@@ -16,6 +16,7 @@ from src.services.uploader import Uploader
 logger = logging.getLogger(__name__)
 
 BOT_DOWNLOAD_LIMIT = 2 * 1024 ** 3
+BOT_PART_SIZE = int(1.95 * 1024 ** 3)
 PREMIUM_DOWNLOAD_LIMIT = 4 * 1024 ** 3
 MAX_PIPELINE_SLOTS = 4
 
@@ -686,6 +687,38 @@ class Worker:
         logger.info("[Worker] %s media processing completed.", task_id[:8])
         return processed_path
 
+    @staticmethod
+    def _part_filename(filename: str, part_number: int) -> str:
+        base, ext = os.path.splitext(filename)
+        return f"{base} P{part_number}{ext}"
+
+    async def _split_output_for_bot(
+        self, task: dict, file_path: str, output_filename: str
+    ) -> list[tuple[str, str]]:
+        if os.path.getsize(file_path) <= BOT_PART_SIZE:
+            return [(file_path, output_filename)]
+
+        task_dir = os.path.join(self.temp_base, task["task_id"])
+        os.makedirs(task_dir, exist_ok=True)
+
+        parts = []
+        part_number = 1
+        with open(file_path, "rb") as src:
+            while True:
+                chunk = src.read(BOT_PART_SIZE)
+                if not chunk:
+                    break
+                name = self._part_filename(output_filename, part_number)
+                path = os.path.join(task_dir, name)
+                with open(path, "wb") as dst:
+                    dst.write(chunk)
+                parts.append((path, name))
+                part_number += 1
+
+        if not parts:
+            raise RuntimeError("Failed to split oversized output.")
+        return parts
+
     async def _upload(self, task: dict, file_path: str, job: dict):
         task_id = task["task_id"]
         self._ensure_runtime_directories()
@@ -699,12 +732,8 @@ class Worker:
 
         use_premium_dump = self._uses_premium_dump(task)
 
-        if use_premium_dump:
-            if not self.has_premium_download_session:
-                raise RuntimeError(
-                    "Files above 2 GiB require a valid SESSION_STRING "
-                    "for a Telegram Premium account."
-                )
+        if use_premium_dump and not self.has_premium_download_session:
+            use_premium_dump = False
 
             if not self._premium_dump_chat_id:
                 raise RuntimeError(
@@ -719,51 +748,44 @@ class Worker:
             upload_client = self.client
             upload_chat_id = self._dump_chat_id
 
-        upload_data = {
-            **task,
-            "upload_file_path": file_path,
-            "output_filename": job["output_filename"],
-            "send_type": job.get("send_type", "media"),
-            "thumbnail_path": await self._resolve_thumbnail(task, job),
-            "upload_chat_id": upload_chat_id,
-        }
+        output_filename = job["output_filename"]
 
-        uploader = Uploader(
-            upload_client,
-            upload_data,
-            self.task_queue,
-            tmp_dir=self.temp_base,
-            user_is_premium=use_premium_dump,
-        )
-
-        results = await uploader.upload()
-
-        if not results:
-            raise RuntimeError(
-                "Upload completed without returning a dump message."
+        # Premium uploads stay whole. Without Premium, split only the final
+        # processed output and upload each part through the available client.
+        if use_premium_dump:
+            upload_parts = [(file_path, output_filename)]
+        else:
+            upload_parts = await self._split_output_for_bot(
+                task, file_path, output_filename
             )
 
-        task["dump_renamed_message_ids"] = [
-            result.id
-            for result in results
-            if result and getattr(result, "id", None)
-        ]
+        results = []
+        for part_path, part_name in upload_parts:
+            upload_data = {
+                **task,
+                "upload_file_path": part_path,
+                "output_filename": part_name,
+                "send_type": job.get("send_type", "media"),
+                "thumbnail_path": await self._resolve_thumbnail(task, job),
+                "upload_chat_id": upload_chat_id,
+            }
 
-        if len(task["dump_renamed_message_ids"]) != len(results):
-            raise RuntimeError("Upload returned an invalid dump message.")
+            uploader = Uploader(
+                upload_client,
+                upload_data,
+                self.task_queue,
+                tmp_dir=self.temp_base,
+                user_is_premium=use_premium_dump,
+            )
 
-        self.task_queue.checkpoint(task_id)
+            part_results = await uploader.upload()
+            if not part_results:
+                raise RuntimeError(
+                    f"Upload returned no dump message for {part_name}."
+                )
+            results.extend(part_results)
 
-        # The Premium session is used only to upload the processed file to the
-        # dump channel when the file is above the bot's upload limit. Delivery
-        # to the user must ALWAYS be performed by the BOT_TOKEN client.
-        #
-        # Architecture:
-        #   Premium session -> dump channel
-        #   BOT_TOKEN       -> copy from dump channel -> user's DM
-        #
-        # Do not let the Premium user session send/forward the final file to
-        # the user.
+        # Final delivery is ALWAYS BOT_TOKEN -> user DM.
         for result in results:
             await self.client.copy_message(
                 chat_id=task["user_id"],

@@ -270,7 +270,7 @@ class Uploader:
 
         with open(file_path, "rb") as src:
             while True:
-                part_name = f"{base} Part {idx}{ext}"
+                part_name = f"{base} P{idx}{ext}"
                 part_path = os.path.join(task_folder, part_name)
                 written = 0
 
