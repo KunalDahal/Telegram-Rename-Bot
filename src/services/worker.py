@@ -48,15 +48,25 @@ class Worker:
         self.pool_size = max(1, int(configured_pool or MAX_PIPELINE_SLOTS))
         self.max_rename_at_once = self.pool_size
         self.download_limit = max(1, min(int(getattr(config, "dl_limit", self.pool_size)), self.pool_size))
+        # Premium downloads have their own admission limit so PL controls
+        # Premium-session parallelism independently of normal bot downloads.
+        self.premium_download_limit = max(
+            1, min(int(getattr(config, "pl_limit", self.pool_size)), self.pool_size)
+        )
         self.upload_limit = max(1, min(int(getattr(config, "ul_limit", 1)), self.pool_size))
         self.watermark_limit = max(1, min(int(getattr(config, "wm_limit", 1)), self.pool_size))
 
         self._download_slot = asyncio.Semaphore(self.download_limit)
+        self._premium_download_slot = asyncio.Semaphore(self.premium_download_limit)
         self._watermark_processing_slot = asyncio.Semaphore(self.watermark_limit)
         self._upload_slot = asyncio.Semaphore(self.upload_limit)
         logger.info(
-            "[Worker] Concurrency limits: global=%d download=%d upload=%d watermark=%d",
-            self.pool_size, self.download_limit, self.upload_limit, self.watermark_limit,
+            "[Worker] Concurrency limits: global=%d download=%d premium_download=%d upload=%d watermark=%d",
+            self.pool_size,
+            self.download_limit,
+            self.premium_download_limit,
+            self.upload_limit,
+            self.watermark_limit,
         )
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._pool_worker_tasks: list[asyncio.Task] = []
@@ -117,6 +127,7 @@ class Worker:
             api_hash=self.config.api_hash,
             session_string=session_string,
             in_memory=True,
+            max_concurrent_transmissions=self.premium_download_limit,
             no_updates=True,
         )
 
@@ -528,11 +539,17 @@ class Worker:
         # "waiting_for_download" accurately means waiting for a downloader slot.
         await self._stage_source_to_dump(task)
 
+        use_premium = file_size > BOT_DOWNLOAD_LIMIT
+        download_slot = (
+            self._premium_download_slot if use_premium else self._download_slot
+        )
+
         self.task_queue.update_status(task_id, "waiting_for_download", 0)
-        async with self._download_slot:
+        async with download_slot:
             self.task_queue.update_status(task_id, "downloading", 0)
-            use_premium = file_size > BOT_DOWNLOAD_LIMIT
-            download_client = self._premium_download_client if use_premium else self.client
+            download_client = (
+                self._premium_download_client if use_premium else self.client
+            )
             downloader = Downloader(self.temp_base, self.task_queue, task_id)
             path = await downloader.download(
                 client=download_client,
