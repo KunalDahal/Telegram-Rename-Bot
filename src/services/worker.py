@@ -739,11 +739,16 @@ class Worker:
 
         self.task_queue.checkpoint(task_id)
 
-        # BOT_TOKEN performs delivery even when the Premium client uploaded
-        # the file. Both sessions have been validated against the same dump
-        # channel when Premium is enabled.
+        # Files above 2 GiB are uploaded by the Premium user session.
+        # The bot session must not be used to copy those large messages: the
+        # bot-side Telegram transfer path is limited differently and can return
+        # "Can't copy this message" for Premium-sized media.
+        #
+        # Use the same Premium client that uploaded the message for Premium
+        # delivery. Normal files continue to use the bot client.
+        delivery_client = upload_client if use_premium_dump else self.client
         for result in results:
-            await self.client.copy_message(
+            await delivery_client.copy_message(
                 chat_id=task["user_id"],
                 from_chat_id=upload_chat_id,
                 message_id=result.id,
